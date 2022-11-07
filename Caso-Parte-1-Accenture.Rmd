@@ -1,0 +1,334 @@
+---
+title: "Accenture Study Case"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Loading data
+
+```{r}
+library(readxl)
+charges <- read_excel("Dataset/Data.xlsx", 
+    sheet = "Charges", col_types = c("text","numeric", "numeric"))
+
+other_data <- read_excel("Dataset/Data.xlsx", 
+    sheet = "Other data", col_types = c("text", 
+                          "text", "numeric", "text", "text", 
+                          "numeric", "text", "text", "text", 
+                          "text", "text", "text", "text", "text", 
+                          "text", "text", "text", "text"))
+
+churn <- read_excel("Dataset/Data.xlsx", 
+    sheet = "Churn", col_types = c("text", "text"))
+
+```
+
+Merging datasets
+```{r}
+df <- merge(charges,other_data,by='customerID')
+df <- merge(df,churn,by='customerID')
+head(df)
+```
+
+## Data exploration
+```{r}
+col_names <-names(df)
+for (i in 2:ncol(df)){
+  x<-df[,i]
+  print(col_names[i])
+  if(class(x)=="character"){
+    print(summary(factor(x)))
+  }else{
+    print(summary(x))
+  }
+    }
+
+```
+
+### Filling missing values
+Too few to really affect outcome.Let's keep it simple
+
+```{r}
+df$MonthlyCharges[is.na(df$MonthlyCharges)]<-mean(df$MonthlyCharges,na.rm=T)
+df$TotalCharges[is.na(df$TotalCharges)]<-mean(df$TotalCharges,na.rm=T)
+```
+
+Pivot tables to compare different default rates for discrete data
+```{r}
+library(dplyr)
+simple_dummie_variables<-c("Partner","Dependents","PhoneService","MultipleLines",
+                        "OnlineSecurity","OnlineBackup","DeviceProtection","TechSupport",
+                        "StreamingTV","StreamingMovies","PaperlessBilling")
+
+df[,col_names %in% c("gender","Churn")] %>% group_by(gender) %>% 
+    summarise(default_rate=sum(Churn=="Yes")/length(Churn)) %>% print()
+
+for(u in simple_dummie_variables){
+  df[,col_names %in% c(u,"Churn")] %>% group_by_at(vars(one_of(u))) %>% 
+    summarise(default_rate=sum(Churn=="Yes")/length(Churn)) %>% print()
+}
+```
+Some distribution graphs
+```{r}
+hist(df$MonthlyCharges)
+```
+
+```{r}
+hist(df$TotalCharges)
+
+```
+```{r}
+hist(df$tenure)
+```
+```{r}
+boxplot(tenure~Churn,df)
+```
+```{r}
+boxplot(MonthlyCharges~Churn,df)
+```
+```{r}
+boxplot(TotalCharges~Churn,df)
+```
+Let's see the different distibutions of our continues data
+```{r}
+library(GGally)
+ ggpairs(df,columns = c(2,3,8), ggplot2::aes(colour=Churn)) 
+```
+
+## Data transformations
+
+```{r}
+df$gender<-ifelse(df$gender=="Female",1,0)
+simple_dummie_variables<-c("Partner","Dependents","PhoneService","MultipleLines",
+                        "OnlineSecurity","OnlineBackup","DeviceProtection","TechSupport",
+                        "StreamingTV","StreamingMovies","PaperlessBilling","Churn")
+
+multiple_dummie_variables<-c("InternetService","Contract","PaymentMethod")
+
+
+#tranforming to dummies
+for(j in simple_dummie_variables){
+  df[,col_names %in% j] <- ifelse((grepl("No",df[,col_names %in% j],fixed = T)),0,1)
+}
+
+df<-fastDummies::dummy_cols(df, remove_first_dummy = TRUE, 
+                            select_columns = multiple_dummie_variables)
+df<-df[,!(col_names %in% multiple_dummie_variables)]
+row.names(df)<-df$customerID
+
+df<-df[,-1]
+#Eliminating spaces and parenthesis
+names(df)<- gsub(' ',"_",names(df))
+names(df)<- gsub("\\(","",names(df))
+names(df)<- gsub("\\)","",names(df))
+
+
+# Some ratios
+df$TotalCharges_div_MonthlyCharges <-df$MonthlyCharges/df$TotalCharges
+df$MonthlyCharges_div_TotalCharges <-df$TotalCharges/df$MonthlyCharges
+col_names<-names(df)
+
+#reescaling from 0 to 1
+rescaling_variables<-c("MonthlyCharges","TotalCharges","tenure",
+                       "TotalCharges_div_MonthlyCharges",
+                       "MonthlyCharges_div_TotalCharges")
+rescaling_factors<-data.frame()
+for(k in rescaling_variables){
+  min_value<- min(df[,col_names %in% k],na.rm = T)
+  max_value<- max(df[,col_names %in% k],na.rm = T)
+  df[,col_names %in% k] <- (df[,col_names %in% k]-min_value)/(max_value-min_value)
+  rescaling_factors<- rbind(data.frame(names=k,min=min_value,max=max_value),
+                            rescaling_factors)
+}
+
+#Some interactions,but no gain
+#not applied
+
+#df$MonthlyCharges_x_gender <- df$gender*df$MonthlyCharges
+#df$tenure_x_gender <- df$tenure*df$gender
+#df$TotalCharges_x_gender <- df$TotalCharges*df$gender
+#df$TotalCharges_x_multiplelines <-df$TotalCharges*df$MultipleLines
+#df$MonthlyCharges_x_multiplelines<-df$MonthlyCharges*df$MultipleLines
+#df$MultipleLines_x_internet_Fiber <-df$InternetService_Fiber_optic*df$MultipleLines
+#df$MultipleLines_x_internet_No<- df$InternetService_No*df$MultipleLines
+
+```
+
+
+## Data Modelling
+
+```{r}
+set.seed(123)
+
+sample <- sample(c(TRUE, FALSE), nrow(df), replace=TRUE, prob=c(0.8,0.2))
+df_train  <- df[sample, ]
+df_test   <- df[!sample, ]
+```
+
+## Lasso Regression
+
+Determining the best lambda value. Calculating multiple iterations
+```{r}
+library(glmnet)
+#alpha = 1 for lasso(l1), if it is between 0 and 1 is elastic net, 0 is ridge(l2)
+x<-as.matrix(df_train[,!(names(df_train) %in% 'Churn')])
+cv.lasso <- cv.glmnet(x, df_train$Churn, alpha = 1, family = "binomial")
+plot(cv.lasso)
+
+```
+
+trainning final model with best lambda
+```{r}
+#cv.lasso$lambda.min
+model <- glmnet(x, df_train$Churn, family = "binomial",
+                lambda = cv.lasso$lambda.min)
+model
+```
+Model results coefficients
+```{r}
+cv.lasso$lambda.min
+coef(model)
+```
+Model results for test data, probability threshold(.52) increases accuracy
+```{r}
+x<-as.matrix(df_test[,!(names(df_test) %in% 'Churn')])
+probabilities <- predict(model,x, type = "response")
+predicted.classes <- ifelse(probabilities > 0.52, 1, 0)
+# Model accuracy
+observed.classes <- df_test$Churn
+caret::confusionMatrix(as.factor(predicted.classes),as.factor(observed.classes))
+```
+Model results for train data, probability threshold(.52) increases accuracy
+```{r}
+x<-as.matrix(df_train[,!(names(df_train) %in% 'Churn')])
+probabilities <- predict(model,x, type = "response")
+predicted.classes <- ifelse(probabilities > 0.52, 1, 0)
+# Model accuracy
+observed.classes <- df_train$Churn
+caret::confusionMatrix(as.factor(predicted.classes),as.factor(observed.classes))
+```
+
+Model results for train data for positive predictions. Multiple probability thresholds 
+```{r}
+x<-as.matrix(df_train[,!(names(df_train) %in% 'Churn')])
+probabilities <- predict(model,x, type = "response")
+
+probailities_vector<-seq(.5,1,.01)
+
+default_rates<-lapply(probailities_vector,FUN = function(z){
+  predicted.classes <- ifelse(probabilities > z, 1, 0)
+  # Model accuracy
+  observed.classes <- df_train$Churn
+  matrix<-caret::confusionMatrix(as.factor(predicted.classes),as.factor(observed.classes))
+  return(matrix[["table"]][1,2]/(matrix[["table"]][1,1]+matrix[["table"]][1,2])) })
+
+default_rates<-t(as.data.frame(default_rates))
+
+default_rates<-as.data.frame(cbind(probailities_vector,default_rates))
+names(default_rates)[1]<-"probability_threshold"
+names(default_rates)[2]<-"default_rates"
+
+default_rates %>%
+  ggplot( aes(x=probability_threshold, y=default_rates)) +
+    geom_line() +
+    geom_point()
+
+```
+
+Model results for test data in high confidence predictions (<.35, >.65)
+
+```{r}
+x<-as.matrix(df_test[,!(names(df_test) %in% 'Churn')])
+probabilities <- predict(model,x, type = "response")
+percentiles<-quantile(probabilities,probs = c(.10,.15,.2,.25,.75,.8,.85,.9))
+percentiles
+filter1<-(probabilities>=0.66 ) | (probabilities<=0.35)
+observed.classes <- df_test$Churn[filter1]
+predicted.classes <-ifelse(probabilities > 0.52, 1, 0)[filter1]
+caret::confusionMatrix(as.factor(predicted.classes),
+                       as.factor(observed.classes))
+```
+Model results for train data in high confidence predictions (<.35, >.65)
+```{r}
+x<-as.matrix(df_train[,!(names(df_train) %in% 'Churn')])
+probabilities <- predict(model,x, type = "response")
+percentiles<-quantile(probabilities,probs = c(.10,.15,.2,.25,.75,.8,.85,.9))
+percentiles
+filter1<-(probabilities>=0.65 ) | (probabilities<=0.35)
+observed.classes <- df_train$Churn[filter1]
+predicted.classes <-ifelse(probabilities > 0.52, 1, 0)[filter1]
+caret::confusionMatrix(as.factor(predicted.classes),
+                       as.factor(observed.classes))
+```
+Model results for all population in high confidence positive predictions(>.65)
+```{r}
+x<-as.matrix(df[,!(names(df) %in% 'Churn')])
+probabilities <- predict(model,x, type = "response")
+percentiles<-quantile(probabilities,probs = c(.10,.15,.2,.25,.75,.8,.85,.9))
+percentiles
+filter1<-probabilities>=0.65 
+observed.classes <- df$Churn[filter1]
+predicted.classes <-ifelse(probabilities > 0.52, 1, 0)[filter1]
+caret::confusionMatrix(as.factor(predicted.classes),
+                       as.factor(observed.classes))
+```
+### Random Forest
+```{r}
+df_train$Churn<-as.factor(df_train$Churn)
+library(randomForest)
+model1<-randomForest(Churn~., data=df_train, proximity=TRUE,ntree=600,mtry=1)
+```
+Model results for test data
+```{r}
+x<-as.matrix(df_test[,!(names(df_test) %in% 'Churn')])
+predicted.classes<- predict(model1,x, type = "response")
+# Model accuracy
+observed.classes <- df_test$Churn
+caret::confusionMatrix(as.factor(predicted.classes),as.factor(observed.classes))
+```
+Model results for train data
+```{r}
+x<-as.matrix(df_train[,!(names(df_train) %in% 'Churn')])
+predicted.classes<- predict(model1,x, type = "response")
+# Model accuracy
+observed.classes <- df_train$Churn
+caret::confusionMatrix(as.factor(predicted.classes),as.factor(observed.classes))
+```
+### support vector machines
+```{r}
+library(e1071)
+
+model3 = svm(Churn~., data=df_train, kernel = "linear", scale = FALSE)
+print(model3)
+```
+Model results for train data
+```{r}
+x<-as.matrix(df_train[,!(names(df_train) %in% 'Churn')])
+predicted.classes<- predict(model3,x, type = "response")
+# Model accuracy
+observed.classes <- df_train$Churn
+caret::confusionMatrix(as.factor(predicted.classes),as.factor(observed.classes))
+```
+Model results for test data
+```{r}
+x<-as.matrix(df_test[,!(names(df_test) %in% 'Churn')])
+predicted.classes<- predict(model3,x, type = "response")
+# Model accuracy
+observed.classes <- df_test$Churn
+caret::confusionMatrix(as.factor(predicted.classes),as.factor(observed.classes))
+```
+We go for lasso regression. Let's calculate fetuare importance of the model
+```{r}
+coes<-coef(model)
+coeficients<-data.frame(name = coes@Dimnames[[1]][coes@i + 1], coefficient = coes@x)
+coeficients
+```
+```{r}
+coeficients$abs_values<-abs(coeficients$coefficient)
+coeficients$Importance<- coeficients$abs_values/sum(coeficients$abs_values)
+coeficients
+```
+
+
+
